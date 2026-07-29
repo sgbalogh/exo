@@ -29,6 +29,12 @@ export default defineConfig({
           import.meta.url,
         ),
       ),
+      "@exo/model-runtime/cost": fileURLToPath(
+        new URL("./exoharness/typescript/model-runtime/cost.ts", import.meta.url),
+      ),
+      "@exo/codex/app-server": fileURLToPath(
+        new URL("./exoharness/typescript/codex/app-server.ts", import.meta.url),
+      ),
     },
   },
 });
