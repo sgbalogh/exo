@@ -307,8 +307,13 @@ impl EventKind {
         &self.0
     }
 
+    /// Canonical storage name, normalizing legacy conversation event names to thread names.
+    pub fn canonical_name(&self) -> &str {
+        canonical_event_kind(self.as_str())
+    }
+
     pub fn matches(&self, other: &Self) -> bool {
-        canonical_event_kind(self.as_str()) == canonical_event_kind(other.as_str())
+        self.canonical_name() == other.canonical_name()
     }
 }
 
@@ -398,6 +403,26 @@ impl Event {
     pub fn conversation_id(&self) -> ConversationId {
         self.thread_id
     }
+}
+
+/// Durable event-log identity within an [`EventStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventLogId {
+    pub agent_id: AgentId,
+    pub thread_id: ThreadId,
+}
+
+#[async_trait]
+/// Durable event persistence used by harness handles.
+///
+/// Implementations must preserve [`EventQuery`] ordering, cursor, filtering, and limit semantics.
+pub trait EventStore: Send + Sync {
+    async fn append(&self, log_id: EventLogId, events: &[Event]) -> Result<()>;
+    async fn query(&self, log_id: EventLogId, query: Option<EventQuery>)
+    -> Result<GetEventsResult>;
+    async fn get(&self, log_id: EventLogId, event_id: EventId) -> Result<Option<Event>>;
+    async fn delete_log(&self, log_id: EventLogId) -> Result<()>;
+    async fn delete_agent_logs(&self, agent_id: AgentId) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

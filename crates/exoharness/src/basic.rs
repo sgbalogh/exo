@@ -36,17 +36,17 @@ use crate::{
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
     BindingType, BoxAsyncRead, BoxAsyncWrite, CancelSandboxProcessRequest,
     CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, ConversationRecord,
-    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
-    EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
-    GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment, SandboxHandle, SandboxId,
-    SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId,
-    SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord, SandboxProcessStatus,
-    SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret, SecretId, SecretMetadata,
-    SecretType, SessionId, SnapshotHandle, SnapshotId, StartSandboxProcessRequest,
-    StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7, WaitSandboxProcessRequest,
-    WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventLogId,
+    EventQuery, EventQueryDirection, EventStore, EventStream, ExoHarness, FileSystemMount,
+    ForkConversationRequest, GetEventsResult, GetSandboxProcessEventsResult,
+    ListConversationsRequest, ListConversationsResult, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ReadArtifactRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
+    SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig, Secret,
+    SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
@@ -343,6 +343,7 @@ pub struct BasicExoHarness {
 
 struct BasicExoHarnessInner {
     storage: BasicObjectStore,
+    event_store: Arc<dyn EventStore>,
     write_lock: AsyncMutex<()>,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
@@ -351,6 +352,69 @@ struct BasicExoHarnessInner {
     running_sandboxes: AsyncMutex<HashMap<SandboxId, Arc<dyn ManagedSandboxHandle>>>,
     running_processes: AsyncMutex<HashMap<SandboxProcessId, Arc<RunningSandboxProcess>>>,
     secret_cipher: SecretCipher,
+}
+
+#[derive(Clone)]
+struct FilesystemEventStore {
+    storage: BasicObjectStore,
+}
+
+impl FilesystemEventStore {
+    fn new(storage: BasicObjectStore) -> Self {
+        Self { storage }
+    }
+
+    fn events_dir(log_id: EventLogId) -> PathBuf {
+        PathBuf::from("agents")
+            .join(log_id.agent_id.to_string())
+            .join("conversations")
+            .join(log_id.thread_id.to_string())
+            .join("events")
+    }
+}
+
+#[async_trait]
+impl EventStore for FilesystemEventStore {
+    async fn append(&self, log_id: EventLogId, events: &[Event]) -> Result<()> {
+        let events_dir = Self::events_dir(log_id);
+        for event in events {
+            self.storage
+                .put_json(events_dir.join(format!("{}.json", event.id)), event)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn query(
+        &self,
+        log_id: EventLogId,
+        query: Option<EventQuery>,
+    ) -> Result<GetEventsResult> {
+        let events = load_events(&self.storage, &Self::events_dir(log_id)).await?;
+        Ok(filter_events(events, query))
+    }
+
+    async fn get(&self, log_id: EventLogId, event_id: EventId) -> Result<Option<Event>> {
+        self.storage
+            .get_json_if_exists(Self::events_dir(log_id).join(format!("{event_id}.json")))
+            .await
+    }
+
+    async fn delete_log(&self, log_id: EventLogId) -> Result<()> {
+        self.storage.delete_prefix(Self::events_dir(log_id)).await
+    }
+
+    async fn delete_agent_logs(&self, agent_id: AgentId) -> Result<()> {
+        let conversations_dir = PathBuf::from("agents")
+            .join(agent_id.to_string())
+            .join("conversations");
+        for key in self.storage.list_keys(conversations_dir).await? {
+            if key.contains("/events/") {
+                self.storage.delete_key_if_exists(Path::new(&key)).await?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BasicExoHarnessInner {
@@ -770,7 +834,17 @@ fn nonempty_env(name: &str) -> Option<String> {
 
 impl BasicExoHarness {
     pub async fn new(config: BasicExoHarnessConfig) -> Result<Self> {
-        Self::new_with_backend(config, None).await
+        Self::new_with_backend(config, None, None).await
+    }
+
+    /// Builds the basic harness with caller-provided durable event persistence.
+    ///
+    /// Records, artifacts, secrets, and sandbox state continue to use the configured root.
+    pub async fn new_with_event_store(
+        config: BasicExoHarnessConfig,
+        event_store: Arc<dyn EventStore>,
+    ) -> Result<Self> {
+        Self::new_with_backend(config, None, Some(event_store)).await
     }
 
     #[cfg(test)]
@@ -778,7 +852,7 @@ impl BasicExoHarness {
         config: BasicExoHarnessConfig,
         sandbox_backend: Arc<dyn ManagedSandboxBackend>,
     ) -> Result<Self> {
-        Self::new_with_backend(config, Some(sandbox_backend)).await
+        Self::new_with_backend(config, Some(sandbox_backend), None).await
     }
 
     #[cfg(test)]
@@ -793,6 +867,7 @@ impl BasicExoHarness {
     async fn new_with_backend(
         config: BasicExoHarnessConfig,
         seed: Option<Arc<dyn ManagedSandboxBackend>>,
+        event_store: Option<Arc<dyn EventStore>>,
     ) -> Result<Self> {
         let BasicExoHarnessConfig {
             root,
@@ -818,11 +893,15 @@ impl BasicExoHarness {
         }
 
         let storage = BasicObjectStore::local_filesystem(&root).await?;
+        let event_store = event_store.unwrap_or_else(|| {
+            Arc::new(FilesystemEventStore::new(storage.clone())) as Arc<dyn EventStore>
+        });
         let secret_cipher =
             build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
         Ok(Self {
             inner: Arc::new(BasicExoHarnessInner {
                 storage,
+                event_store,
                 write_lock: AsyncMutex::new(()),
                 subscribers: Mutex::new(HashMap::new()),
                 sandbox_registry: registry,
@@ -971,6 +1050,7 @@ impl ExoHarness for BasicExoHarness {
                 "agent dir exists without record.json; cannot release slug marker, continuing with delete"
             );
         }
+        self.inner.event_store.delete_agent_logs(*id).await?;
         self.inner.storage.delete_prefix(agent_dir).await?;
         Ok(true)
     }
@@ -1221,7 +1301,7 @@ impl AgentHandle for BasicAgentHandle {
         let mut record = record;
         append_events_to_conversation(
             &self.harness.inner,
-            &conversation_dir,
+            self.record.id,
             record.id,
             None,
             None,
@@ -1267,7 +1347,7 @@ impl AgentHandle for BasicAgentHandle {
         {
             append_events_to_conversation(
                 &self.harness.inner,
-                &conversation_dir,
+                self.record.id,
                 record.id,
                 None,
                 None,
@@ -1277,6 +1357,14 @@ impl AgentHandle for BasicAgentHandle {
             )
             .await?;
         }
+        self.harness
+            .inner
+            .event_store
+            .delete_log(EventLogId {
+                agent_id: self.record.id,
+                thread_id: *id,
+            })
+            .await?;
         self.harness
             .inner
             .storage
@@ -1500,7 +1588,10 @@ fn paginate_conversation_records(
 #[derive(Debug, Clone, Copy)]
 enum SandboxOwner {
     Agent(AgentId),
-    Conversation(ConversationId),
+    Conversation {
+        agent_id: AgentId,
+        conversation_id: ConversationId,
+    },
 }
 
 struct BasicScopedSandboxHandle<'a> {
@@ -1513,10 +1604,10 @@ struct BasicScopedSandboxHandle<'a> {
 enum BasicSandboxEventSink<'a> {
     None,
     Conversation {
-        conversation_id: ConversationId,
+        log_id: EventLogId,
     },
     Turn {
-        conversation_id: ConversationId,
+        log_id: EventLogId,
         session_id: SessionId,
         turn_id: TurnId,
         state: &'a Mutex<BasicTurnState>,
@@ -1535,31 +1626,47 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     fn conversation(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
         conversation_dir: PathBuf,
     ) -> Self {
+        let log_id = EventLogId {
+            agent_id,
+            thread_id: conversation_id,
+        };
         Self {
             harness,
             owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
-            event_sink: BasicSandboxEventSink::Conversation { conversation_id },
+            owner: SandboxOwner::Conversation {
+                agent_id,
+                conversation_id,
+            },
+            event_sink: BasicSandboxEventSink::Conversation { log_id },
         }
     }
 
     fn turn(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
         conversation_dir: PathBuf,
         session_id: SessionId,
         turn_id: TurnId,
         state: &'a Mutex<BasicTurnState>,
     ) -> Self {
+        let log_id = EventLogId {
+            agent_id,
+            thread_id: conversation_id,
+        };
         Self {
             harness,
             owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
-            event_sink: BasicSandboxEventSink::Turn {
+            owner: SandboxOwner::Conversation {
+                agent_id,
                 conversation_id,
+            },
+            event_sink: BasicSandboxEventSink::Turn {
+                log_id,
                 session_id,
                 turn_id,
                 state,
@@ -1579,14 +1686,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let prepared = prepare_sandbox_request(self.harness, request).await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         if let Some((sandbox_id, sandbox)) = self.find_matching_sandbox(&prepared).await? {
-            let (_handle, provider_state_event) = active_sandbox_handle(
-                self.harness,
-                &self.owner_dir,
-                self.owner,
-                &sandbox_id,
-                &sandbox,
-            )
-            .await?;
+            let (_handle, provider_state_event) =
+                active_sandbox_handle(self.harness, self.owner, &sandbox_id, &sandbox).await?;
             if let Some(event) = provider_state_event {
                 self.append_events_locked(vec![event]).await?;
             }
@@ -1614,14 +1715,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             latest_snapshot_id: None,
             attachment: Some(request.attachment),
         };
-        let (sandbox_handle, provider_state_event) = create_sandbox_handle(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &sandbox_id,
-            &sandbox,
-        )
-        .await?;
+        let (sandbox_handle, provider_state_event) =
+            create_sandbox_handle(self.harness, self.owner, &sandbox_id, &sandbox).await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         self.persist_attached_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
             .await
@@ -1636,14 +1731,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             }
             bail!("sandbox is not running: {sandbox_id}");
         }
-        let (sandbox_handle, provider_state_event) = active_sandbox_handle(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &sandbox_id,
-            &sandbox,
-        )
-        .await?;
+        let (sandbox_handle, provider_state_event) =
+            active_sandbox_handle(self.harness, self.owner, &sandbox_id, &sandbox).await?;
         let attachment = sandbox_handle.detach().await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         self.harness
@@ -1847,14 +1936,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         if request.command.is_empty() {
             bail!("sandbox command must not be empty");
         }
-        let (sandbox_handle, provider_state_event) = active_sandbox_handle(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &request.id,
-            &sandbox,
-        )
-        .await?;
+        let (sandbox_handle, provider_state_event) =
+            active_sandbox_handle(self.harness, self.owner, &request.id, &sandbox).await?;
         if let Some(event) = provider_state_event {
             self.append_events(vec![event]).await?;
         }
@@ -1882,14 +1965,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let prepared = prepare_sandbox_request(self.harness, request).await?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let sandbox = prepared.stored_sandbox(sandbox_id.clone());
-        let (sandbox_handle, provider_state_event) = create_sandbox_handle(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &sandbox_id,
-            &sandbox,
-        )
-        .await?;
+        let (sandbox_handle, provider_state_event) =
+            create_sandbox_handle(self.harness, self.owner, &sandbox_id, &sandbox).await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         self.persist_created_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
             .await
@@ -1901,14 +1978,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     ) -> Result<SandboxId> {
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let sandbox = request.stored_sandbox(sandbox_id.clone());
-        let (sandbox_handle, provider_state_event) = create_sandbox_handle(
-            self.harness,
-            &self.owner_dir,
-            self.owner,
-            &sandbox_id,
-            &sandbox,
-        )
-        .await?;
+        let (sandbox_handle, provider_state_event) =
+            create_sandbox_handle(self.harness, self.owner, &sandbox_id, &sandbox).await?;
         self.persist_created_sandbox_locked(sandbox, sandbox_handle, provider_state_event)
             .await
     }
@@ -2025,12 +2096,26 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let Some(name) = &request.name else {
             return Ok(None);
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.owner_dir.join("events"))
+        let BasicSandboxEventSink::Conversation { log_id } = self.event_sink else {
+            bail!("named sandbox lookup requires a conversation event log");
+        };
+        let events = self
+            .harness
+            .inner
+            .event_store
+            .query(
+                log_id,
+                Some(EventQuery {
+                    cursor: None,
+                    direction: Some(EventQueryDirection::Asc),
+                    limit: None,
+                    session_id: None,
+                    turn_id: None,
+                    types: Some(vec![EventKind::SANDBOX_CREATED]),
+                }),
+            )
             .await?
-            .into_iter()
-            .filter(|event| event.data.kind() == EventKind::SANDBOX_CREATED)
-            .collect::<Vec<_>>();
-        events.sort_by_key(|event| event.id);
+            .events;
 
         for event in events.into_iter().rev() {
             let EventData::SandboxCreated {
@@ -2085,13 +2170,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     fn process_event_log(&self) -> Option<SandboxProcessEventLog> {
         match self.event_sink {
             BasicSandboxEventSink::None | BasicSandboxEventSink::Turn { .. } => None,
-            BasicSandboxEventSink::Conversation { conversation_id } => {
-                Some(SandboxProcessEventLog {
-                    inner: Arc::clone(&self.harness.inner),
-                    conversation_id,
-                    conversation_dir: self.owner_dir.clone(),
-                })
-            }
+            BasicSandboxEventSink::Conversation { log_id } => Some(SandboxProcessEventLog {
+                inner: Arc::clone(&self.harness.inner),
+                log_id,
+                conversation_dir: self.owner_dir.clone(),
+            }),
         }
     }
 
@@ -2106,7 +2189,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     async fn append_events_locked(&self, data: Vec<EventData>) -> Result<()> {
         match self.event_sink {
             BasicSandboxEventSink::None => Ok(()),
-            BasicSandboxEventSink::Conversation { conversation_id } => {
+            BasicSandboxEventSink::Conversation { log_id } => {
                 let mut record = self
                     .harness
                     .inner
@@ -2115,8 +2198,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     .await?;
                 append_events_to_conversation(
                     &self.harness.inner,
-                    &self.owner_dir,
-                    conversation_id,
+                    log_id.agent_id,
+                    log_id.thread_id,
                     None,
                     None,
                     record.latest_event_id,
@@ -2132,7 +2215,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 Ok(())
             }
             BasicSandboxEventSink::Turn {
-                conversation_id,
+                log_id,
                 session_id,
                 turn_id,
                 state,
@@ -2146,8 +2229,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     .await?;
                 let add_result = append_events_to_conversation(
                     &self.harness.inner,
-                    &self.owner_dir,
-                    conversation_id,
+                    log_id.agent_id,
+                    log_id.thread_id,
                     Some(session_id),
                     Some(turn_id),
                     expected_head,
@@ -2224,7 +2307,7 @@ impl ConversationHandle for BasicConversationHandle {
 
         let add_result = append_events_to_conversation(
             &self.harness.inner,
-            &conversation_dir,
+            self.agent_id,
             self.record.id,
             Some(session_id),
             Some(turn_record.id),
@@ -2241,6 +2324,7 @@ impl ConversationHandle for BasicConversationHandle {
 
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir,
             conversation_id: self.record.id,
             record: turn_record,
@@ -2252,7 +2336,23 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let events = self
+            .harness
+            .inner
+            .event_store
+            .query(
+                self.event_log_id(),
+                Some(EventQuery {
+                    cursor: None,
+                    direction: Some(EventQueryDirection::Asc),
+                    limit: None,
+                    session_id: Some(record.session_id),
+                    turn_id: Some(record.id),
+                    types: None,
+                }),
+            )
+            .await?
+            .events;
         let mut latest_event_id = None;
         let mut finished = false;
         for event in events
@@ -2272,6 +2372,7 @@ impl ConversationHandle for BasicConversationHandle {
         }
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir: self.conversation_dir(),
             conversation_id: self.record.id,
             record,
@@ -2283,51 +2384,65 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_events(&self, query: Option<EventQuery>) -> Result<GetEventsResult> {
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
-        if let Some(query) = query {
-            if let Some(session_id) = query.session_id {
-                events.retain(|event| event.session_id == Some(session_id));
-            }
-            if let Some(turn_id) = query.turn_id {
-                events.retain(|event| event.turn_id == Some(turn_id));
-            }
-            if let Some(types) = query.types {
-                events.retain(|event| {
-                    let event_kind = event.data.kind();
-                    types.iter().any(|kind| kind.matches(&event_kind))
-                });
-            }
-            match query.direction.unwrap_or(EventQueryDirection::Asc) {
-                EventQueryDirection::Asc => {
-                    if let Some(cursor) = query.cursor {
-                        events.retain(|event| event.id > cursor);
-                    }
-                }
-                EventQueryDirection::Desc => {
-                    events.reverse();
-                    if let Some(cursor) = query.cursor {
-                        events.retain(|event| event.id < cursor);
-                    }
-                }
-            }
-            if let Some(limit) = query.limit {
-                events.truncate(limit as usize);
-            }
-        }
-        let cursor = events.last().map(|event| event.id);
-        Ok(GetEventsResult { events, cursor })
+        self.harness
+            .inner
+            .event_store
+            .query(self.event_log_id(), query)
+            .await
     }
 
     async fn watch_events(&self, after_exclusive: Bound<EventId>) -> Result<EventStream> {
         let _guard = self.harness.inner.write_lock.lock().await;
         let existing = match after_exclusive {
             Bound::Unbounded => Vec::new(),
-            _ => {
-                let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+            Bound::Excluded(cursor) => {
+                self.harness
+                    .inner
+                    .event_store
+                    .query(
+                        self.event_log_id(),
+                        Some(EventQuery {
+                            cursor: Some(cursor),
+                            direction: Some(EventQueryDirection::Asc),
+                            limit: None,
+                            session_id: None,
+                            turn_id: None,
+                            types: None,
+                        }),
+                    )
+                    .await?
+                    .events
+            }
+            Bound::Included(cursor) => {
+                let mut events = Vec::new();
+                if let Some(event) = self
+                    .harness
+                    .inner
+                    .event_store
+                    .get(self.event_log_id(), cursor)
+                    .await?
+                {
+                    events.push(event);
+                }
+                events.extend(
+                    self.harness
+                        .inner
+                        .event_store
+                        .query(
+                            self.event_log_id(),
+                            Some(EventQuery {
+                                cursor: Some(cursor),
+                                direction: Some(EventQueryDirection::Asc),
+                                limit: None,
+                                session_id: None,
+                                turn_id: None,
+                                types: None,
+                            }),
+                        )
+                        .await?
+                        .events,
+                );
                 events
-                    .into_iter()
-                    .filter(|event| matches_bound(event.id, &after_exclusive))
-                    .collect::<Vec<_>>()
             }
         };
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2346,8 +2461,11 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_event(&self, id: EventId) -> Result<Option<Event>> {
-        let path = self.events_dir().join(format!("{id}.json"));
-        self.harness.inner.storage.get_json_if_exists(&path).await
+        self.harness
+            .inner
+            .event_store
+            .get(self.event_log_id(), id)
+            .await
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
@@ -2382,7 +2500,13 @@ impl ConversationHandle for BasicConversationHandle {
             }
             None => derive_unique_slug("fork", &existing),
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut events = self
+            .harness
+            .inner
+            .event_store
+            .query(self.event_log_id(), None)
+            .await?
+            .events;
         if let Some(limit) = request.up_to_inclusive {
             events.retain(|event| event.id <= limit);
         }
@@ -2415,20 +2539,25 @@ impl ConversationHandle for BasicConversationHandle {
             .await?;
 
         let mut latest_event_id = None;
+        let mut forked_events = Vec::with_capacity(events.len());
         for mut event in events {
             let new_event_id = Uuid7::now();
             event.id = new_event_id;
             event.thread_id = record.id;
             event.created_at = new_event_id.timestamp().expect("uuid7 timestamp");
             latest_event_id = Some(new_event_id);
+            forked_events.push(event);
+        }
+        if !forked_events.is_empty() {
             self.harness
                 .inner
-                .storage
-                .put_json(
-                    conversation_dir
-                        .join("events")
-                        .join(format!("{}.json", event.id)),
-                    &event,
+                .event_store
+                .append(
+                    EventLogId {
+                        agent_id: self.agent_id,
+                        thread_id: record.id,
+                    },
+                    &forked_events,
                 )
                 .await?;
         }
@@ -2437,7 +2566,7 @@ impl ConversationHandle for BasicConversationHandle {
         fork_record.latest_event_id = latest_event_id;
         append_events_to_conversation(
             &self.harness.inner,
-            &conversation_dir,
+            self.agent_id,
             record.id,
             None,
             None,
@@ -2469,7 +2598,7 @@ impl ConversationHandle for BasicConversationHandle {
         let mut record = self.load_record().await?;
         append_events_to_conversation(
             &self.harness.inner,
-            &conversation_dir,
+            self.agent_id,
             self.record.id,
             None,
             None,
@@ -2643,6 +2772,7 @@ impl BasicSandboxScope for BasicConversationHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
         BasicScopedSandboxHandle::conversation(
             &self.harness,
+            self.agent_id,
             self.record.id,
             self.conversation_dir(),
         )
@@ -2662,8 +2792,11 @@ impl BasicConversationHandle {
             .join(self.record.id.to_string())
     }
 
-    fn events_dir(&self) -> PathBuf {
-        self.conversation_dir().join("events")
+    fn event_log_id(&self) -> EventLogId {
+        EventLogId {
+            agent_id: self.agent_id,
+            thread_id: self.record.id,
+        }
     }
 
     fn bindings_dir(&self) -> PathBuf {
@@ -2702,7 +2835,7 @@ impl BasicConversationHandle {
         let mut record = self.load_record().await?;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
-            &conversation_dir,
+            self.agent_id,
             self.record.id,
             session_id,
             turn_id,
@@ -2998,7 +3131,6 @@ async fn find_matching_stored_sandbox(
 
 async fn active_sandbox_handle(
     harness: &BasicExoHarness,
-    owner_dir: &Path,
     owner: SandboxOwner,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
@@ -3015,7 +3147,7 @@ async fn active_sandbox_handle(
     }
 
     let (handle, provider_state_event) =
-        create_sandbox_handle(harness, owner_dir, owner, sandbox_id, sandbox).await?;
+        create_sandbox_handle(harness, owner, sandbox_id, sandbox).await?;
     harness
         .inner
         .running_sandboxes
@@ -3027,21 +3159,14 @@ async fn active_sandbox_handle(
 
 async fn create_sandbox_handle(
     harness: &BasicExoHarness,
-    owner_dir: &Path,
     owner: SandboxOwner,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> Result<(Arc<dyn ManagedSandboxHandle>, Option<EventData>)> {
     let state_key = sandbox_provider_state_key(owner, sandbox_id, sandbox);
-    let previous_state = load_sandbox_provider_state(
-        harness,
-        owner_dir,
-        owner,
-        sandbox_id,
-        sandbox.provider,
-        &state_key,
-    )
-    .await?;
+    let previous_state =
+        load_sandbox_provider_state(harness, owner, sandbox_id, sandbox.provider, &state_key)
+            .await?;
     let backend = harness
         .inner
         .sandbox_backend_for_provider(sandbox.provider)
@@ -3072,22 +3197,38 @@ fn sandbox_provider_state_key(
 
 async fn load_sandbox_provider_state(
     harness: &BasicExoHarness,
-    owner_dir: &Path,
     owner: SandboxOwner,
     sandbox_id: &SandboxId,
     provider: SandboxProvider,
     state_key: &str,
 ) -> Result<Option<Value>> {
-    let SandboxOwner::Conversation(_) = owner else {
+    let SandboxOwner::Conversation {
+        agent_id,
+        conversation_id,
+    } = owner
+    else {
         return Ok(None);
     };
-    let mut events = load_events(&harness.inner.storage, &owner_dir.join("events"))
+    let events = harness
+        .inner
+        .event_store
+        .query(
+            EventLogId {
+                agent_id,
+                thread_id: conversation_id,
+            },
+            Some(EventQuery {
+                cursor: None,
+                direction: Some(EventQueryDirection::Desc),
+                limit: None,
+                session_id: None,
+                turn_id: None,
+                types: Some(vec![EventKind::custom(SANDBOX_PROVIDER_STATE_EVENT)]),
+            }),
+        )
         .await?
-        .into_iter()
-        .filter(|event| event.data.kind() == EventKind::custom(SANDBOX_PROVIDER_STATE_EVENT))
-        .collect::<Vec<_>>();
-    events.sort_by_key(|event| event.id);
-    for event in events.into_iter().rev() {
+        .events;
+    for event in events {
         let EventData::Custom {
             event_type,
             payload,
@@ -3156,6 +3297,7 @@ async fn require_running_sandbox_process(
 
 struct BasicTurnHandle {
     harness: BasicExoHarness,
+    agent_id: AgentId,
     conversation_dir: PathBuf,
     conversation_id: ConversationId,
     record: TurnRecord,
@@ -3171,6 +3313,7 @@ impl BasicSandboxScope for BasicTurnHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
         BasicScopedSandboxHandle::turn(
             &self.harness,
+            self.agent_id,
             self.conversation_id,
             self.conversation_dir.clone(),
             self.record.session_id,
@@ -3197,7 +3340,7 @@ impl TurnHandle for BasicTurnHandle {
         let expected_head = record.latest_event_id;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
-            &self.conversation_dir,
+            self.agent_id,
             self.conversation_id,
             Some(self.record.session_id),
             Some(self.record.id),
@@ -3235,7 +3378,7 @@ impl TurnHandle for BasicTurnHandle {
         .await?;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
-            &self.conversation_dir,
+            self.agent_id,
             self.conversation_id,
             Some(self.record.session_id),
             Some(self.record.id),
@@ -3279,7 +3422,7 @@ impl TurnHandle for BasicTurnHandle {
         let expected_head = record.latest_event_id;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
-            &self.conversation_dir,
+            self.agent_id,
             self.conversation_id,
             Some(self.record.session_id),
             Some(self.record.id),
@@ -3403,7 +3546,7 @@ async fn prepare_sandbox_process(
         bail!("basic sandbox backend only supports exec-mode processes");
     }
     let (sandbox_handle, provider_state_event) =
-        active_sandbox_handle(harness, owner_dir, owner, &request.sandbox_id, &sandbox).await?;
+        active_sandbox_handle(harness, owner, &request.sandbox_id, &sandbox).await?;
     let process_id = format!("process-{}", Uuid7::now());
     let sandbox_id = request.sandbox_id.clone();
     let command = request.command.clone();
@@ -3526,7 +3669,7 @@ struct RunningSandboxProcess {
 
 struct SandboxProcessEventLog {
     inner: Arc<BasicExoHarnessInner>,
-    conversation_id: ConversationId,
+    log_id: EventLogId,
     conversation_dir: PathBuf,
 }
 
@@ -3744,8 +3887,8 @@ async fn append_sandbox_process_data(
         .await?;
     append_events_to_conversation(
         &event_log.inner,
-        &event_log.conversation_dir,
-        event_log.conversation_id,
+        event_log.log_id.agent_id,
+        event_log.log_id.thread_id,
         None,
         None,
         record.latest_event_id,
@@ -3825,7 +3968,9 @@ fn sandbox_request(
                 agent_id: agent_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
-            SandboxOwner::Conversation(conversation_id) => SandboxKey::ConversationSandbox {
+            SandboxOwner::Conversation {
+                conversation_id, ..
+            } => SandboxKey::ConversationSandbox {
                 conversation_id: conversation_id.to_string(),
                 sandbox_id: sandbox_id.to_string(),
             },
@@ -3865,7 +4010,7 @@ fn sandbox_request(
 
 async fn append_events_to_conversation(
     inner: &BasicExoHarnessInner,
-    conversation_dir: &Path,
+    agent_id: AgentId,
     conversation_id: ConversationId,
     session_id: Option<SessionId>,
     turn_id: Option<TurnId>,
@@ -3884,32 +4029,28 @@ async fn append_events_to_conversation(
             turn_id,
         )?;
     }
-    let mut event_ids = Vec::new();
-    let mut latest_event_id = None;
+    let mut events = Vec::with_capacity(data.len());
     for data in data {
         let id = Uuid7::now();
-        let event = Event {
+        events.push(Event {
             id,
             thread_id: conversation_id,
             session_id,
             turn_id,
             created_at: id.timestamp().expect("uuid7 timestamp"),
             data,
-        };
-        inner
-            .storage
-            .put_json(
-                conversation_dir
-                    .join("events")
-                    .join(format!("{}.json", event.id)),
-                &event,
-            )
-            .await?;
-        notify_subscribers(inner, conversation_id, event.clone());
-        latest_event_id = Some(event.id);
-        event_ids.push(event.id);
+        });
     }
-    let latest_event_id = latest_event_id.expect("at least one event");
+    let log_id = EventLogId {
+        agent_id,
+        thread_id: conversation_id,
+    };
+    inner.event_store.append(log_id, &events).await?;
+    for event in &events {
+        notify_subscribers(inner, conversation_id, event.clone());
+    }
+    let event_ids = events.iter().map(|event| event.id).collect::<Vec<_>>();
+    let latest_event_id = events.last().expect("at least one event").id;
     record.latest_event_id = Some(latest_event_id);
     Ok(AddEventsResult {
         event_ids,
@@ -3985,20 +4126,47 @@ fn notify_subscribers(inner: &BasicExoHarnessInner, conversation_id: Conversatio
     entries.retain(|sender| sender.send(Ok(event.clone())).is_ok());
 }
 
-fn matches_bound(event_id: EventId, bound: &Bound<EventId>) -> bool {
-    match bound {
-        Bound::Unbounded => false,
-        Bound::Included(id) => event_id >= *id,
-        Bound::Excluded(id) => event_id > *id,
-    }
-}
-
 async fn load_events(storage: &BasicObjectStore, events_dir: &Path) -> Result<Vec<Event>> {
     let mut events = storage
         .list_json_matching_suffix::<Event>(events_dir, ".json")
         .await?;
     events.sort_by_key(|event| event.id);
     Ok(events)
+}
+
+fn filter_events(mut events: Vec<Event>, query: Option<EventQuery>) -> GetEventsResult {
+    if let Some(query) = query {
+        if let Some(session_id) = query.session_id {
+            events.retain(|event| event.session_id == Some(session_id));
+        }
+        if let Some(turn_id) = query.turn_id {
+            events.retain(|event| event.turn_id == Some(turn_id));
+        }
+        if let Some(types) = query.types {
+            events.retain(|event| {
+                let event_kind = event.data.kind();
+                types.iter().any(|kind| kind.matches(&event_kind))
+            });
+        }
+        match query.direction.unwrap_or(EventQueryDirection::Asc) {
+            EventQueryDirection::Asc => {
+                if let Some(cursor) = query.cursor {
+                    events.retain(|event| event.id > cursor);
+                }
+            }
+            EventQueryDirection::Desc => {
+                events.reverse();
+                if let Some(cursor) = query.cursor {
+                    events.retain(|event| event.id < cursor);
+                }
+            }
+        }
+        if let Some(limit) = query.limit {
+            events.truncate(limit as usize);
+        }
+    }
+    let cursor = events.last().map(|event| event.id);
+    GetEventsResult { events, cursor }
 }
 
 async fn load_artifact_versions(
