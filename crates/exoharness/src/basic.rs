@@ -2336,7 +2336,7 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
-        let events = self
+        let event = self
             .harness
             .inner
             .event_store
@@ -2344,32 +2344,28 @@ impl ConversationHandle for BasicConversationHandle {
                 self.event_log_id(),
                 Some(EventQuery {
                     cursor: None,
-                    direction: Some(EventQueryDirection::Asc),
-                    limit: None,
+                    direction: Some(EventQueryDirection::Desc),
+                    limit: Some(1),
                     session_id: Some(record.session_id),
                     turn_id: Some(record.id),
                     types: None,
                 }),
             )
             .await?
-            .events;
-        let mut latest_event_id = None;
-        let mut finished = false;
-        for event in events
+            .events
             .into_iter()
             .filter(|event| event.session_id == Some(record.session_id))
             .filter(|event| event.turn_id == Some(record.id))
-        {
-            latest_event_id = Some(event.id);
-            finished = matches!(event.data, EventData::TurnEnded);
-        }
-        if latest_event_id.is_none() {
-            bail!(
-                "turn {} in session {} was not found",
-                record.id,
-                record.session_id
-            );
-        }
+            .next()
+            .ok_or_else(|| {
+                anyhow!(
+                    "turn {} in session {} was not found",
+                    record.id,
+                    record.session_id
+                )
+            })?;
+        let latest_event_id = event.id;
+        let finished = matches!(event.data, EventData::TurnEnded);
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
             agent_id: self.agent_id,
@@ -2377,7 +2373,7 @@ impl ConversationHandle for BasicConversationHandle {
             conversation_id: self.record.id,
             record,
             state: Mutex::new(BasicTurnState {
-                latest_event_id,
+                latest_event_id: Some(latest_event_id),
                 finished,
             }),
         }))

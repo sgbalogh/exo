@@ -1112,17 +1112,53 @@ function truncatePriorMessageText(
 }
 
 function messagesToUserInput(messages: Message[]): JsonValue[] {
-  const text = messages
-    .filter((message) => message.role === "user")
-    .map(messageText)
-    .join("\n\n");
-  return [
+  const userMessages = messages.filter((message) => message.role === "user");
+  const selectedMessages = userMessages.length > 0 ? userMessages : messages;
+  const text = selectedMessages.map(messageText).join("\n\n");
+  const input: JsonValue[] = [
     {
       type: "text",
-      text: text || messages.map(messageText).join("\n\n"),
+      text,
       text_elements: [],
     },
   ];
+
+  for (const message of selectedMessages) {
+    for (const url of messageImageUrls(message)) {
+      input.push({ type: "image", url });
+    }
+  }
+  return input;
+}
+
+function messageImageUrls(message: Message): string[] {
+  if (!Array.isArray(message.content)) {
+    return [];
+  }
+  return message.content.flatMap((part) => {
+    const url = linguaImageUrl(part);
+    return url === null ? [] : [url];
+  });
+}
+
+function linguaImageUrl(part: unknown): string | null {
+  if (!isRecord(part) || part.type !== "image") {
+    return null;
+  }
+  const image = part.image;
+  if (typeof image !== "string") {
+    return null;
+  }
+  if (
+    image.startsWith("data:") ||
+    image.startsWith("https://") ||
+    image.startsWith("http://")
+  ) {
+    return image;
+  }
+  const mediaType =
+    typeof part.media_type === "string" ? part.media_type : "image/png";
+  return `data:${mediaType};base64,${image}`;
 }
 
 function codexDeveloperInstructions(context: TurnContext): string | null {
