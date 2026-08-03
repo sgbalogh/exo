@@ -2871,9 +2871,9 @@ impl ConversationHandle for BasicConversationHandle {
             .await?
             .events
             .into_iter()
-            .filter(|event| event.session_id == Some(record.session_id))
-            .filter(|event| event.turn_id == Some(record.id))
-            .next()
+            .find(|event| {
+                event.session_id == Some(record.session_id) && event.turn_id == Some(record.id)
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "turn {} in session {} was not found",
