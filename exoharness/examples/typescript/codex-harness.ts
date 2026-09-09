@@ -284,7 +284,19 @@ async function runCodexTurn(
       warm_session_key: sessionKey,
     },
     async () => {
-      const cached = await codexSessions.get(sessionKey, startSession);
+      const cached = await codexSessions.getReusable(
+        sessionKey,
+        startSession,
+        (warmSession) => warmSession.server.isRunning(),
+        (warmSession) => warmSession.close(),
+      );
+      if (cached.invalidated) {
+        await appendCustomEvent(turn, "codex_warm_session_invalidated", {
+          metadata: turnMetadata(context),
+          warm_session_key: sessionKey,
+          reason: "app_server_stopped",
+        });
+      }
       if (cached.resource.sandboxEpoch === sandboxEpoch) {
         return cached;
       }
@@ -294,7 +306,7 @@ async function runCodexTurn(
         stale_epoch: cached.resource.sandboxEpoch,
         sandbox_epoch: sandboxEpoch,
       });
-      codexSessions.delete(sessionKey, (stale) => stale.close());
+      await codexSessions.delete(sessionKey, (stale) => stale.close());
       return codexSessions.get(sessionKey, startSession);
     },
   );

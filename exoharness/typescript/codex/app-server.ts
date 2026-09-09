@@ -211,6 +211,10 @@ export class CodexAppServer {
     }
   }
 
+  isRunning(): boolean {
+    return !this.closing && !this.finished;
+  }
+
   close(): void {
     this.closing = true;
     void this.transport.close();

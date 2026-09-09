@@ -116,6 +116,33 @@ export class WarmResourceCache<T> {
     return { resource: await created, reused: false };
   }
 
+  async getReusable(
+    key: string,
+    create: () => Promise<T>,
+    canReuse: (resource: T) => boolean,
+    close: (resource: T) => Promise<void> | void,
+  ): Promise<{ resource: T; reused: boolean; invalidated: boolean }> {
+    let invalidated = false;
+    for (;;) {
+      const existing = this.entries.get(key);
+      if (!existing) {
+        return { ...(await this.get(key, create)), invalidated };
+      }
+
+      const resource = await existing;
+      if (canReuse(resource)) {
+        return { resource, reused: true, invalidated };
+      }
+
+      if (this.entries.get(key) !== existing) {
+        continue;
+      }
+      this.entries.delete(key);
+      await close(resource);
+      invalidated = true;
+    }
+  }
+
   async delete(
     key: string,
     close?: (resource: T) => Promise<void> | void,

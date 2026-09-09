@@ -8,7 +8,10 @@ import {
 
 import { runClaudeCodeHarnessTurn } from "../exoharness/examples/typescript/claude-code-harness";
 import { runCodexHarnessTurn } from "../exoharness/examples/typescript/codex-harness";
-import { modelFamily, type ModelFamily } from "../exoharness/examples/typescript/model-family";
+import {
+  modelFamily,
+  type ModelFamily,
+} from "../exoharness/examples/typescript/model-family";
 import { resolveLlmBinding } from "@exo/model-runtime/shared";
 import { registerConfiguredAgentTools } from "@exo/model-runtime/turn-loop";
 import { exoInstructions } from "./harness";
