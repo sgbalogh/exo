@@ -227,9 +227,24 @@ export default defineHarness({
 // Exported so other harnesses can run the codex executor with their own
 // instructions and tools (see coding-executor-harness). A reused warm thread
 // keeps the instructions and dynamic tools it was started with.
+export type CodexReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export interface CodexHarnessTurnOptions extends CodingExecutorTurnOptions {
+  // Sent on every turn, including reused warm threads. The selected model
+  // and installed Codex app-server must support the requested effort.
+  reasoningEffort?: CodexReasoningEffort;
+}
+
 export async function runCodexHarnessTurn(
   context: TurnContext,
-  options: CodingExecutorTurnOptions = {},
+  options: CodexHarnessTurnOptions = {},
 ): Promise<void> {
   const modelBinding = await resolveLlmBinding(context);
   const runtime = ResponsesRuntime.fromModelBinding(
@@ -245,7 +260,7 @@ async function runCodexTurn(
   context: TurnContext,
   turnParent: TraceParent,
   modelBinding: ResolvedLlmBinding,
-  options: CodingExecutorTurnOptions,
+  options: CodexHarnessTurnOptions,
 ): Promise<string | null> {
   await requireCodexSandboxNetworking(context);
 
@@ -384,6 +399,7 @@ async function runCodexTurn(
       {
         thread_id: threadId,
         model: modelBinding.model,
+        reasoning_effort: options.reasoningEffort ?? null,
         input: turnInput,
         external_sandbox: useCodexExternalSandbox(),
       },
@@ -392,6 +408,7 @@ async function runCodexTurn(
           threadId,
           input: turnInput,
           model: modelBinding.model,
+          effort: options.reasoningEffort ?? null,
           approvalPolicy: "on-request",
           sandboxPolicy: codexNativeSandboxPolicy(),
         }),
@@ -399,6 +416,7 @@ async function runCodexTurn(
     await appendCustomEvent(turn, "codex_turn_started", {
       metadata: turnMetadata(context),
       codex_thread_id: threadId,
+      reasoning_effort: options.reasoningEffort ?? null,
       codex_turn: turnStart.turn ?? null,
       hydrated_from: threadReused ? "warm_codex_thread" : "exoharness_events",
       injected_response_items: priorItems.length,
