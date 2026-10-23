@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as AnyhowContext, anyhow, bail};
 use async_trait::async_trait;
@@ -24,7 +24,7 @@ use lingua::UniversalStreamChunk;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::execution_tracing::TurnExecutionTrace;
@@ -42,7 +42,90 @@ pub struct TypeScriptExecutor<T> {
     workspace_root: PathBuf,
     env: Arc<HashMap<String, String>>,
     tools: Arc<T>,
-    runners: Arc<Mutex<HashMap<String, Arc<Mutex<TypeScriptRunnerProcess>>>>>,
+    runners: Arc<RunnerCache>,
+}
+
+const MAX_TYPESCRIPT_RUNNERS: usize = 8;
+const RUNNER_IDLE_TTL: Duration = Duration::from_secs(300);
+
+struct CachedRunner {
+    process: Arc<Mutex<TypeScriptRunnerProcess>>,
+    last_used: Instant,
+}
+
+struct RunnerCache {
+    entries: StdMutex<HashMap<String, CachedRunner>>,
+    capacity: Semaphore,
+    reaper: OnceLock<JoinHandle<()>>,
+}
+
+impl RunnerCache {
+    fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+            capacity: Semaphore::new(MAX_TYPESCRIPT_RUNNERS),
+            reaper: OnceLock::new(),
+        }
+    }
+
+    fn start_reaper(self: &Arc<Self>) {
+        self.reaper.get_or_init(|| {
+            let cache = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let Some(cache) = cache.upgrade() else { return };
+                    cache.retire_idle(Instant::now());
+                }
+            })
+        });
+    }
+
+    fn retire_idle(&self, now: Instant) {
+        self.entries
+            .lock()
+            .expect("runner cache poisoned")
+            .retain(|_, entry| {
+                Arc::strong_count(&entry.process) > 1
+                    || now.saturating_duration_since(entry.last_used) < RUNNER_IDLE_TTL
+            });
+    }
+
+    fn finish(&self, key: &str, runner: &Arc<Mutex<TypeScriptRunnerProcess>>, failed: bool) {
+        let mut entries = self.entries.lock().expect("runner cache poisoned");
+        if let Some(entry) = entries.get_mut(key)
+            && Arc::ptr_eq(&entry.process, runner)
+        {
+            if failed {
+                entries.remove(key);
+            } else {
+                entry.last_used = Instant::now();
+            }
+        }
+    }
+}
+
+impl Drop for RunnerCache {
+    fn drop(&mut self) {
+        if let Some(reaper) = self.reaper.get() {
+            reaper.abort();
+        }
+    }
+}
+
+struct RunnerUse {
+    cache: Arc<RunnerCache>,
+    key: String,
+    process: Arc<Mutex<TypeScriptRunnerProcess>>,
+    succeeded: bool,
+}
+
+impl Drop for RunnerUse {
+    fn drop(&mut self) {
+        // Cancellation may leave unread protocol messages. Never reuse that
+        // process for the next turn, even if execute_turn never returned.
+        self.cache.finish(&self.key, &self.process, !self.succeeded);
+    }
 }
 
 impl<T> TypeScriptExecutor<T> {
@@ -57,7 +140,7 @@ impl<T> TypeScriptExecutor<T> {
             workspace_root,
             env: Arc::new(env),
             tools,
-            runners: Arc::new(Mutex::new(HashMap::new())),
+            runners: Arc::new(RunnerCache::new()),
         }
     }
 }
@@ -117,7 +200,18 @@ where
             bail!("typescript harness module does not exist: {module_path}");
         }
 
-        let runner = self.runner(&module_path).await?;
+        // Upstream #306 scopes runners to a conversation, not just a module.
+        // Keep a bounded warm cache so old conversations do not retain a Node
+        // process forever. The facade already serializes each conversation.
+        let key = format!("{}:{}", conversation.record().id, module_path);
+        let _capacity = self.runners.capacity.acquire().await?;
+        let runner = self.runner(&key, &module_path)?;
+        let mut usage = RunnerUse {
+            cache: Arc::clone(&self.runners),
+            key,
+            process: Arc::clone(&runner),
+            succeeded: false,
+        };
         let result = {
             let mut runner = runner.lock().await;
             runner
@@ -137,9 +231,7 @@ where
                 .await
         };
 
-        if result.is_err() {
-            self.remove_runner(&module_path, &runner).await;
-        }
+        usage.succeeded = result.is_ok();
 
         result
     }
@@ -149,10 +241,21 @@ impl<T> TypeScriptExecutor<T>
 where
     T: ToolRuntime + 'static,
 {
-    async fn runner(&self, module_path: &str) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
-        let mut runners = self.runners.lock().await;
-        if let Some(runner) = runners.get(module_path) {
-            return Ok(Arc::clone(runner));
+    fn runner(&self, key: &str, module_path: &str) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
+        self.runners.start_reaper();
+        let mut runners = self.runners.entries.lock().expect("runner cache poisoned");
+        if let Some(runner) = runners.get_mut(key) {
+            runner.last_used = Instant::now();
+            return Ok(Arc::clone(&runner.process));
+        }
+        if runners.len() >= MAX_TYPESCRIPT_RUNNERS {
+            let oldest = runners
+                .iter()
+                .filter(|(_, entry)| Arc::strong_count(&entry.process) == 1)
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| key.clone())
+                .ok_or_else(|| anyhow!("runner capacity acquired without an idle cache slot"))?;
+            runners.remove(&oldest);
         }
 
         let runner = Arc::new(Mutex::new(TypeScriptRunnerProcess::start(
@@ -160,17 +263,14 @@ where
             self.env.as_ref(),
             module_path,
         )?));
-        runners.insert(module_path.to_string(), Arc::clone(&runner));
+        runners.insert(
+            key.to_string(),
+            CachedRunner {
+                process: Arc::clone(&runner),
+                last_used: Instant::now(),
+            },
+        );
         Ok(runner)
-    }
-
-    async fn remove_runner(&self, module_path: &str, runner: &Arc<Mutex<TypeScriptRunnerProcess>>) {
-        let mut runners = self.runners.lock().await;
-        if let Some(current) = runners.get(module_path)
-            && Arc::ptr_eq(current, runner)
-        {
-            runners.remove(module_path);
-        }
     }
 
     async fn execute_runtime_request(
@@ -222,6 +322,21 @@ struct RunningSandboxProcess {
     sandbox_id: SandboxId,
     process_id: SandboxProcessId,
     event_task: JoinHandle<()>,
+}
+
+impl Drop for TypeScriptRunnerProcess {
+    fn drop(&mut self) {
+        // JoinHandle drops detach tasks. Abort every task that holds a pipe or
+        // follows sandbox output before Child's kill_on_drop stops Node. Warm
+        // sandbox processes remain reconnectable through their durable IDs.
+        self._writer_task.abort();
+        if let Some(stderr) = &self.stderr_task {
+            stderr.abort();
+        }
+        for process in self.sandbox_processes.values() {
+            process.event_task.abort();
+        }
+    }
 }
 
 const TYPESCRIPT_SANDBOX_PROCESS_REUSE_EVENT: &str = "typescript_sandbox_process_reuse";
@@ -1295,6 +1410,10 @@ fn format_error_chain(error: &anyhow::Error, context: std::fmt::Arguments<'_>) -
     }
     message
 }
+
+#[cfg(test)]
+#[path = "typescript_concurrency_tests.rs"]
+mod concurrency_tests;
 
 #[cfg(test)]
 mod tests {

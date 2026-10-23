@@ -736,7 +736,7 @@ async fn resolve_message_conversation(
     Ok(conversation)
 }
 
-fn uses_target_conversation_scope(config: &AdapterConfig) -> bool {
+pub(super) fn uses_target_conversation_scope(config: &AdapterConfig) -> bool {
     config
         .initialization
         .get("conversationScope")

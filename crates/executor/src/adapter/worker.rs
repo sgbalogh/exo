@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow};
+use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -121,6 +123,7 @@ where
         event_rx,
         on_event,
         Arc::clone(&pending_events),
+        super::runtime::uses_target_conversation_scope(config),
     ));
     let mut command_task = tokio::spawn(process_worker_commands(
         stdin,
@@ -216,17 +219,66 @@ async fn process_worker_events<F, Fut>(
     mut event_rx: mpsc::Receiver<WorkerEvent>,
     mut on_event: F,
     pending_events: Arc<AtomicUsize>,
+    target_scoped: bool,
 ) -> Result<()>
 where
     F: FnMut(WorkerEvent) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
-    while let Some(event) = event_rx.recv().await {
-        let result = on_event(event).await;
-        pending_events.fetch_sub(1, Ordering::SeqCst);
-        result?;
+    // Adapt upstream #382's independent-thread dispatch to the older worker
+    // protocol. Keep FIFO admission per target, including conversation creation
+    // and attachment downloads, while acknowledgements keep flowing.
+    const MAX_ACTIVE_TARGETS: usize = 8;
+    const MAX_QUEUED_MESSAGES: usize = 256;
+    let mut queued: HashMap<String, VecDeque<WorkerEvent>> = HashMap::new();
+    let mut queued_count = 0;
+    let mut active = HashSet::new();
+    let mut running: FuturesUnordered<BoxFuture<'static, (String, Result<()>)>> =
+        FuturesUnordered::new();
+    let mut receiving = true;
+
+    loop {
+        while running.len() < MAX_ACTIVE_TARGETS {
+            let Some(key) = queued.keys().find(|key| !active.contains(*key)).cloned() else {
+                break;
+            };
+            let queue = queued.get_mut(&key).expect("queued target");
+            let event = queue.pop_front().expect("queued message");
+            if queue.is_empty() {
+                queued.remove(&key);
+            }
+            queued_count -= 1;
+            active.insert(key.clone());
+            let future = on_event(event);
+            running.push(Box::pin(async move { (key, future.await) }));
+        }
+        if !receiving && running.is_empty() && queued.is_empty() {
+            return Ok(());
+        }
+        tokio::select! {
+            Some((key, result)) = running.next(), if !running.is_empty() => {
+                active.remove(&key);
+                pending_events.fetch_sub(1, Ordering::SeqCst);
+                result?;
+            }
+            event = event_rx.recv(), if receiving && queued_count < MAX_QUEUED_MESSAGES => {
+                match event {
+                    Some(event @ WorkerEvent::Message { .. }) => {
+                        let WorkerEvent::Message { target, .. } = &event else { unreachable!() };
+                        let key = if target_scoped { target.clone() } else { String::new() };
+                        queued.entry(key).or_default().push_back(event);
+                        queued_count += 1;
+                    }
+                    Some(event) => {
+                        let result = on_event(event).await;
+                        pending_events.fetch_sub(1, Ordering::SeqCst);
+                        result?;
+                    }
+                    None => receiving = false,
+                }
+            }
+        }
     }
-    Ok(())
 }
 
 async fn process_worker_commands<G, OutFut>(
@@ -335,6 +387,119 @@ mod tests {
             Some("https://cdn.example/a.png")
         );
         assert_eq!(attachments[0].mime_type.as_deref(), Some("image/png"));
+    }
+
+    #[tokio::test]
+    async fn target_conversations_overlap_preserving_fifo_control_events_and_drain() {
+        check_dispatch(true).await;
+        check_dispatch(false).await;
+    }
+
+    async fn check_dispatch(target_scoped: bool) {
+        let (events_tx, events_rx) = mpsc::channel(8);
+        for (target, text) in [("a", "a1"), ("a", "a2"), ("b", "b1")] {
+            events_tx
+                .send(WorkerEvent::Message {
+                    target: target.into(),
+                    sender: None,
+                    text: text.into(),
+                    message_id: None,
+                    metadata: Value::Null,
+                    attachments: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        events_tx
+            .send(WorkerEvent::CommandAck {
+                command_id: "ack".into(),
+            })
+            .await
+            .unwrap();
+        drop(events_tx);
+        let pending = Arc::new(AtomicUsize::new(4));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let handler = tokio::spawn(process_worker_events(
+            events_rx,
+            {
+                let release = release.clone();
+                move |event| {
+                    let release = release.clone();
+                    let started = started_tx.clone();
+                    async move {
+                        match event {
+                            WorkerEvent::Message { text, .. } => {
+                                started.send(text)?;
+                                release.acquire().await?.forget();
+                            }
+                            WorkerEvent::CommandAck { command_id } => {
+                                started.send(command_id)?;
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    }
+                }
+            },
+            pending.clone(),
+            target_scoped,
+        ));
+        let mut seen = HashSet::new();
+        let expected = if target_scoped { 3 } else { 2 };
+        for _ in 0..expected {
+            seen.insert(
+                tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                    .await
+                    .expect("dispatch stalled")
+                    .unwrap(),
+            );
+        }
+        assert!(seen.contains("a1"));
+        assert!(seen.contains("ack"), "acks must not wait for a model turn");
+        assert!(
+            !seen.contains("a2"),
+            "same-target messages ran concurrently"
+        );
+        assert_eq!(seen.contains("b1"), target_scoped);
+        assert!(
+            !handler.is_finished(),
+            "closed input must drain accepted turns"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err()
+        );
+        release.add_permits(1);
+        if target_scoped {
+            // Either active target may take the permit; release the other too.
+            release.add_permits(1);
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("a2")
+        );
+        release.add_permits(1);
+        if !target_scoped {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("b1")
+            );
+            release.add_permits(1);
+        }
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
